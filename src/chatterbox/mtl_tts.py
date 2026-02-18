@@ -370,23 +370,32 @@ class ChatterboxMultilingualTTS:
             speech_tokens=initial_speech_tokens,
         )
 
-        # Setup model backend
-        # NOTE: The AlignmentStreamAnalyzer in this repo is tuned for English and
-        # actively suppresses EOS for the multilingual model (its heuristics can't
-        # track multilingual attention patterns). We skip it and let the model
-        # emit EOS naturally.
-        if not self.t3.compiled:
-            from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
+        # Setup model backend with multilingual alignment analyzer
+        from .models.t3.inference.alignment_stream_analyzer_mtl import AlignmentStreamAnalyzerMTL
+        from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
 
+        text_tokens_slice = (len_cond, len_cond + text_tokens.size(-1))
+
+        if not self.t3.compiled:
+            self._mtl_analyzer = AlignmentStreamAnalyzerMTL(
+                self.t3.tfmr,
+                None,
+                text_tokens_slice=text_tokens_slice,
+                alignment_layer_idx=9,
+                eos_idx=self.t3.hp.stop_speech_token,
+            )
             patched_model = T3HuggingfaceBackend(
                 config=self.t3.cfg,
                 llama=self.t3.tfmr,
                 speech_enc=self.t3.speech_emb,
                 speech_head=self.t3.speech_head,
-                alignment_stream_analyzer=None,
+                alignment_stream_analyzer=self._mtl_analyzer,
             )
             self.t3.patched_model = patched_model
             self.t3.compiled = True
+        else:
+            # Reset analyzer state for new request
+            self._mtl_analyzer.reset(text_tokens_slice)
 
         device = embeds.device
 
@@ -415,6 +424,7 @@ class ChatterboxMultilingualTTS:
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
+            output_attentions=True,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -429,6 +439,12 @@ class ChatterboxMultilingualTTS:
             logits_uncond = logits[1:2]
             cfg = torch.as_tensor(cfg_weight, device=logits_cond.device, dtype=logits_cond.dtype)
             logits = logits_cond + cfg * (logits_cond - logits_uncond)
+
+            # Alignment analyzer: suppress/force EOS based on attention alignment
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            last_token = generated_ids[0, -1].item() if len(generated_ids[0]) > 0 else None
+            logits = self._mtl_analyzer.step(logits, next_token=last_token)
 
             # Apply repetition penalty
             ids_for_proc = generated_ids[:1, ...]
@@ -473,6 +489,7 @@ class ChatterboxMultilingualTTS:
             output = self.t3.patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
+                output_attentions=True,
                 output_hidden_states=True,
                 return_dict=True,
             )
