@@ -1,3 +1,4 @@
+import logging
 import struct
 import time
 from typing import Optional
@@ -10,6 +11,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
+
+# Ensure alignment analyzer logs are visible
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("chatterbox.models.t3.inference.alignment_stream_analyzer_mtl").setLevel(logging.WARNING)
 
 model: ChatterboxMultilingualTTS = None
 

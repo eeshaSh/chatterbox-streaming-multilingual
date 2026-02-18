@@ -5,6 +5,7 @@
 import logging
 import torch
 from dataclasses import dataclass
+from types import MethodType
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class AlignmentStreamAnalyzerMTL:
 
         # Multi-head attention spies
         self.last_aligned_attns = []
+        self._hook_handles = []
         for i, (layer_idx, head_idx) in enumerate(LLAMA_ALIGNED_HEADS):
             self.last_aligned_attns.append(None)
             self._add_attention_spy(tfmr, i, layer_idx, head_idx)
@@ -53,7 +55,19 @@ class AlignmentStreamAnalyzerMTL:
                 self.last_aligned_attns[buffer_idx] = step_attention[0, head_idx]
 
         target_layer = tfmr.layers[layer_idx].self_attn
-        target_layer.register_forward_hook(attention_forward_hook)
+
+        # Patch forward to ensure output_attentions=True for this layer
+        if not hasattr(target_layer, '_mtl_patched'):
+            original_forward = target_layer.forward
+            def patched_forward(*args, **kwargs):
+                kwargs['output_attentions'] = True
+                return original_forward(*args, **kwargs)
+            target_layer.forward = patched_forward
+            target_layer._mtl_patched = True
+
+        handle = target_layer.register_forward_hook(attention_forward_hook)
+        self._hook_handles.append(handle)
+
         if hasattr(tfmr, 'config') and hasattr(tfmr.config, 'output_attentions'):
             tfmr.config.output_attentions = True
 
@@ -72,6 +86,13 @@ class AlignmentStreamAnalyzerMTL:
             self.last_aligned_attns[k] = None
 
     def step(self, logits, next_token=None):
+        # Check hooks fired
+        none_count = sum(1 for a in self.last_aligned_attns if a is None)
+        if none_count > 0:
+            logger.warning(f"[ASA] frame={self.curr_frame_pos}: {none_count}/{len(self.last_aligned_attns)} attention heads are None (hooks not firing!)")
+            self.curr_frame_pos += 1
+            return logits
+
         # Average attention across tracked heads
         aligned_attn = torch.stack(self.last_aligned_attns).mean(dim=0)
         i, j = self.text_tokens_slice
@@ -80,7 +101,7 @@ class AlignmentStreamAnalyzerMTL:
         else:
             A_chunk = aligned_attn[:, i:j].clone().cpu()
 
-        A_chunk[:, self.curr_frame_pos + 1:] = 0
+        A_chunk[:, min(self.curr_frame_pos + 1, A_chunk.size(-1)):] = 0
 
         self.alignment = torch.cat((self.alignment, A_chunk), dim=0)
 
@@ -103,6 +124,16 @@ class AlignmentStreamAnalyzerMTL:
         self.complete = self.complete or self.text_position >= S - 3
         if self.complete and self.completed_at is None:
             self.completed_at = T
+
+        # Diagnostic logging: first 5 frames detailed, then every 10 frames
+        if self.curr_frame_pos < 5 or self.curr_frame_pos % 10 == 0:
+            attn_max = A_chunk[-1].max().item()
+            logger.warning(
+                f"[ASA] frame={self.curr_frame_pos} text_pos={self.text_position}/{S} "
+                f"cur_argmax={cur_text_posn.item()} attn_max={attn_max:.4f} "
+                f"complete={self.complete} started={self.started} "
+                f"chunk_shape={list(A_chunk.shape)}"
+            )
 
         last_text_token_duration = A[15:, -3:].sum()
 
@@ -127,13 +158,34 @@ class AlignmentStreamAnalyzerMTL:
             len(set(self.generated_tokens[-2:])) == 1
         )
 
-        # Suppress EOS first (only for longer texts)
-        if cur_text_posn < S - 3 and S > 5:
+        # Safety limit: max frames before we stop suppressing EOS
+        # Typical speech is ~5-10 audio frames per text token
+        max_suppress_frames = max(12 * S, 100)
+        # Hard limit: force EOS after this many frames
+        max_generation_frames = max(15 * S, 150)
+
+        past_suppress_limit = self.curr_frame_pos >= max_suppress_frames
+        past_hard_limit = self.curr_frame_pos >= max_generation_frames
+
+        # Suppress EOS first (only for longer texts, and only within safety limit)
+        if cur_text_posn < S - 3 and S > 5 and not past_suppress_limit:
             logits[..., self.eos_idx] = -2**15
 
-        # Force EOS overrides suppress when hallucination detected
-        if long_tail or alignment_repetition or token_repetition:
-            logger.warning(f"forcing EOS token, {long_tail=}, {alignment_repetition=}, {token_repetition=}")
+        if past_suppress_limit and not self.complete:
+            logger.warning(
+                f"[ASA] frame={self.curr_frame_pos}: past suppress limit ({max_suppress_frames}), "
+                f"text_pos={self.text_position}/{S} - no longer suppressing EOS"
+            )
+
+        # Force EOS overrides suppress when hallucination detected OR hard limit hit
+        if long_tail or alignment_repetition or token_repetition or past_hard_limit:
+            if past_hard_limit:
+                logger.warning(
+                    f"[ASA] forcing EOS: hard frame limit ({max_generation_frames}) reached. "
+                    f"text_pos={self.text_position}/{S}, complete={self.complete}"
+                )
+            else:
+                logger.warning(f"[ASA] forcing EOS token, {long_tail=}, {alignment_repetition=}, {token_repetition=}")
             logits = -(2**15) * torch.ones_like(logits)
             logits[..., self.eos_idx] = 2**15
 
