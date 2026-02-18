@@ -370,42 +370,23 @@ class ChatterboxMultilingualTTS:
             speech_tokens=initial_speech_tokens,
         )
 
-        # Setup model backend, and reset alignment analyzer state per request
-        from .models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
-        from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
-
-        text_tokens_slice = (len_cond, len_cond + text_tokens.size(-1))
-
+        # Setup model backend
+        # NOTE: The AlignmentStreamAnalyzer in this repo is tuned for English and
+        # actively suppresses EOS for the multilingual model (its heuristics can't
+        # track multilingual attention patterns). We skip it and let the model
+        # emit EOS naturally.
         if not self.t3.compiled:
-            alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                self.t3.tfmr,
-                None,
-                text_tokens_slice=text_tokens_slice,
-                alignment_layer_idx=9,
-                eos_idx=self.t3.hp.stop_speech_token,
-            )
+            from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
+
             patched_model = T3HuggingfaceBackend(
                 config=self.t3.cfg,
                 llama=self.t3.tfmr,
                 speech_enc=self.t3.speech_emb,
                 speech_head=self.t3.speech_head,
-                alignment_stream_analyzer=alignment_stream_analyzer,
+                alignment_stream_analyzer=None,
             )
             self.t3.patched_model = patched_model
             self.t3.compiled = True
-        else:
-            # Reset analyzer state for new request (text length may differ)
-            asa = self.t3.patched_model.alignment_stream_analyzer
-            i, j = text_tokens_slice
-            asa.text_tokens_slice = text_tokens_slice
-            asa.alignment = torch.zeros(0, j - i)
-            asa.curr_frame_pos = 0
-            asa.text_position = 0
-            asa.started = False
-            asa.started_at = None
-            asa.complete = False
-            asa.completed_at = None
-            asa.last_aligned_attn = None
 
         device = embeds.device
 
@@ -434,7 +415,6 @@ class ChatterboxMultilingualTTS:
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -449,12 +429,6 @@ class ChatterboxMultilingualTTS:
             logits_uncond = logits[1:2]
             cfg = torch.as_tensor(cfg_weight, device=logits_cond.device, dtype=logits_cond.dtype)
             logits = logits_cond + cfg * (logits_cond - logits_uncond)
-
-            # Apply alignment stream analyzer integrity checks
-            if self.t3.patched_model.alignment_stream_analyzer is not None:
-                if logits.dim() == 1:
-                    logits = logits.unsqueeze(0)
-                logits = self.t3.patched_model.alignment_stream_analyzer.step(logits)
 
             # Apply repetition penalty
             ids_for_proc = generated_ids[:1, ...]
@@ -499,7 +473,6 @@ class ChatterboxMultilingualTTS:
             output = self.t3.patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
-                output_attentions=True,
                 output_hidden_states=True,
                 return_dict=True,
             )
