@@ -439,8 +439,7 @@ class ChatterboxMultilingualTTS:
             if self.t3.patched_model.alignment_stream_analyzer is not None:
                 if logits.dim() == 1:
                     logits = logits.unsqueeze(0)
-                last_token = generated_ids[0, -1].item() if len(generated_ids[0]) > 0 else None
-                logits = self.t3.patched_model.alignment_stream_analyzer.step(logits, next_token=last_token)
+                logits = self.t3.patched_model.alignment_stream_analyzer.step(logits)
 
             # Apply repetition penalty
             ids_for_proc = generated_ids[:1, ...]
