@@ -1,5 +1,6 @@
-import io
 import struct
+from typing import Optional
+
 import torch
 import numpy as np
 from contextlib import asynccontextmanager
@@ -67,7 +68,7 @@ def audio_tensor_to_pcm16(tensor: torch.Tensor) -> bytes:
 class TTSRequest(BaseModel):
     text: str
     language: str = Field(description="ISO 639-1 language code, e.g. 'en', 'fr', 'zh'")
-    audio_prompt_path: str | None = None
+    audio_prompt_path: Optional[str] = None
     exaggeration: float = 0.5
     cfg_weight: float = 0.5
     temperature: float = 0.8

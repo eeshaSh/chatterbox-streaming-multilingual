@@ -26,6 +26,12 @@ dependencies = [
     "sounddevice==0.5.2"
 ]
 
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/davidbrowne17/chatterbox-streaming"
 Repository = "https://github.com/davidbrowne17/chatterbox-streaming"
