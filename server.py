@@ -10,31 +10,36 @@ from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 
 # Ensure alignment analyzer logs are visible
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("chatterbox.models.t3.inference.alignment_stream_analyzer_mtl").setLevel(logging.WARNING)
 
-model: ChatterboxMultilingualTTS = None
+model_en: ChatterboxTTS = None
+model_mtl: ChatterboxMultilingualTTS = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model
+    global model_en, model_mtl
     if torch.cuda.is_available():
         device = "cuda"
     elif torch.backends.mps.is_available():
         device = "mps"
     else:
         device = "cpu"
+    print(f"Loading English model on {device}...")
+    model_en = ChatterboxTTS.from_pretrained(device=device)
+    print("English model loaded.")
     print(f"Loading multilingual model on {device}...")
-    model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-    print("Model loaded.")
+    model_mtl = ChatterboxMultilingualTTS.from_pretrained(device=device)
+    print("Multilingual model loaded.")
     yield
 
 
-app = FastAPI(title="Chatterbox Multilingual TTS", lifespan=lifespan)
+app = FastAPI(title="Chatterbox TTS", lifespan=lifespan)
 
 SAMPLE_RATE = 24000
 CHANNELS = 1
@@ -73,7 +78,6 @@ def audio_tensor_to_pcm16(tensor: torch.Tensor) -> bytes:
 
 class TTSRequest(BaseModel):
     text: str
-    language: str = Field(description="ISO 639-1 language code, e.g. 'en', 'fr', 'zh'")
     audio_prompt_path: Optional[str] = None
     exaggeration: float = 0.5
     cfg_weight: float = 0.5
@@ -81,15 +85,90 @@ class TTSRequest(BaseModel):
     chunk_size: int = 25
 
 
+class TTSMultilingualRequest(TTSRequest):
+    language: str = Field(description="ISO 639-1 language code, e.g. 'en', 'fr', 'zh'")
+
+
+# ── English streaming endpoints ──
+
 @app.post("/tts")
 async def tts_stream(req: TTSRequest):
     def generate():
         t0 = time.time()
         chunk_idx = 0
         total_audio = 0.0
-        print(f"[TTS] text={req.text!r}  lang={req.language}")
+        print(f"[TTS-EN] text={req.text!r}")
         yield wav_header()
-        for audio_chunk, _metrics in model.generate_stream(
+        for audio_chunk, _metrics in model_en.generate_stream(
+            text=req.text,
+            audio_prompt_path=req.audio_prompt_path,
+            exaggeration=req.exaggeration,
+            cfg_weight=req.cfg_weight,
+            temperature=req.temperature,
+            chunk_size=req.chunk_size,
+            print_metrics=False,
+        ):
+            elapsed = time.time() - t0
+            chunk_dur = audio_chunk.shape[-1] / SAMPLE_RATE
+            total_audio += chunk_dur
+            if chunk_idx == 0:
+                print(f"[TTS-EN] TTFB: {elapsed:.3f}s")
+            chunk_idx += 1
+            yield audio_tensor_to_pcm16(audio_chunk)
+        total_time = time.time() - t0
+        rtf = total_time / total_audio if total_audio > 0 else float("inf")
+        print(f"[TTS-EN] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
+
+    return StreamingResponse(generate(), media_type="audio/wav")
+
+
+@app.get("/tts")
+async def tts_stream_get(
+    text: str = Query(...),
+    exaggeration: float = Query(0.5),
+    cfg_weight: float = Query(0.5),
+    temperature: float = Query(0.8),
+    chunk_size: int = Query(25),
+):
+    def generate():
+        t0 = time.time()
+        chunk_idx = 0
+        total_audio = 0.0
+        print(f"[TTS-EN] text={text!r}")
+        yield wav_header()
+        for audio_chunk, _metrics in model_en.generate_stream(
+            text=text,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            chunk_size=chunk_size,
+            print_metrics=False,
+        ):
+            elapsed = time.time() - t0
+            chunk_dur = audio_chunk.shape[-1] / SAMPLE_RATE
+            total_audio += chunk_dur
+            if chunk_idx == 0:
+                print(f"[TTS-EN] TTFB: {elapsed:.3f}s")
+            chunk_idx += 1
+            yield audio_tensor_to_pcm16(audio_chunk)
+        total_time = time.time() - t0
+        rtf = total_time / total_audio if total_audio > 0 else float("inf")
+        print(f"[TTS-EN] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
+
+    return StreamingResponse(generate(), media_type="audio/wav")
+
+
+# ── Multilingual streaming endpoints ──
+
+@app.post("/tts/multilingual")
+async def tts_multilingual_stream(req: TTSMultilingualRequest):
+    def generate():
+        t0 = time.time()
+        chunk_idx = 0
+        total_audio = 0.0
+        print(f"[TTS-MTL] text={req.text!r}  lang={req.language}")
+        yield wav_header()
+        for audio_chunk, _metrics in model_mtl.generate_stream(
             text=req.text,
             language_id=req.language,
             audio_prompt_path=req.audio_prompt_path,
@@ -103,18 +182,18 @@ async def tts_stream(req: TTSRequest):
             chunk_dur = audio_chunk.shape[-1] / SAMPLE_RATE
             total_audio += chunk_dur
             if chunk_idx == 0:
-                print(f"[TTS] TTFB: {elapsed:.3f}s")
+                print(f"[TTS-MTL] TTFB: {elapsed:.3f}s")
             chunk_idx += 1
             yield audio_tensor_to_pcm16(audio_chunk)
         total_time = time.time() - t0
         rtf = total_time / total_audio if total_audio > 0 else float("inf")
-        print(f"[TTS] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
+        print(f"[TTS-MTL] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
 
     return StreamingResponse(generate(), media_type="audio/wav")
 
 
-@app.get("/tts")
-async def tts_stream_get(
+@app.get("/tts/multilingual")
+async def tts_multilingual_stream_get(
     text: str = Query(...),
     language: str = Query(..., description="ISO 639-1 code"),
     exaggeration: float = Query(0.5),
@@ -126,9 +205,9 @@ async def tts_stream_get(
         t0 = time.time()
         chunk_idx = 0
         total_audio = 0.0
-        print(f"[TTS] text={text!r}  lang={language}")
+        print(f"[TTS-MTL] text={text!r}  lang={language}")
         yield wav_header()
-        for audio_chunk, _metrics in model.generate_stream(
+        for audio_chunk, _metrics in model_mtl.generate_stream(
             text=text,
             language_id=language,
             exaggeration=exaggeration,
@@ -141,12 +220,12 @@ async def tts_stream_get(
             chunk_dur = audio_chunk.shape[-1] / SAMPLE_RATE
             total_audio += chunk_dur
             if chunk_idx == 0:
-                print(f"[TTS] TTFB: {elapsed:.3f}s")
+                print(f"[TTS-MTL] TTFB: {elapsed:.3f}s")
             chunk_idx += 1
             yield audio_tensor_to_pcm16(audio_chunk)
         total_time = time.time() - t0
         rtf = total_time / total_audio if total_audio > 0 else float("inf")
-        print(f"[TTS] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
+        print(f"[TTS-MTL] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
 
     return StreamingResponse(generate(), media_type="audio/wav")
 
