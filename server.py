@@ -1,4 +1,5 @@
 import struct
+import time
 from typing import Optional
 
 import torch
@@ -78,6 +79,10 @@ class TTSRequest(BaseModel):
 @app.post("/tts")
 async def tts_stream(req: TTSRequest):
     def generate():
+        t0 = time.time()
+        chunk_idx = 0
+        total_audio = 0.0
+        print(f"[TTS] text={req.text!r}  lang={req.language}")
         yield wav_header()
         for audio_chunk, _metrics in model.generate_stream(
             text=req.text,
@@ -89,7 +94,16 @@ async def tts_stream(req: TTSRequest):
             chunk_size=req.chunk_size,
             print_metrics=False,
         ):
+            elapsed = time.time() - t0
+            chunk_dur = audio_chunk.shape[-1] / SAMPLE_RATE
+            total_audio += chunk_dur
+            if chunk_idx == 0:
+                print(f"[TTS] TTFB: {elapsed:.3f}s")
+            chunk_idx += 1
             yield audio_tensor_to_pcm16(audio_chunk)
+        total_time = time.time() - t0
+        rtf = total_time / total_audio if total_audio > 0 else float("inf")
+        print(f"[TTS] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
 
     return StreamingResponse(generate(), media_type="audio/wav")
 
@@ -104,6 +118,10 @@ async def tts_stream_get(
     chunk_size: int = Query(25),
 ):
     def generate():
+        t0 = time.time()
+        chunk_idx = 0
+        total_audio = 0.0
+        print(f"[TTS] text={text!r}  lang={language}")
         yield wav_header()
         for audio_chunk, _metrics in model.generate_stream(
             text=text,
@@ -114,7 +132,16 @@ async def tts_stream_get(
             chunk_size=chunk_size,
             print_metrics=False,
         ):
+            elapsed = time.time() - t0
+            chunk_dur = audio_chunk.shape[-1] / SAMPLE_RATE
+            total_audio += chunk_dur
+            if chunk_idx == 0:
+                print(f"[TTS] TTFB: {elapsed:.3f}s")
+            chunk_idx += 1
             yield audio_tensor_to_pcm16(audio_chunk)
+        total_time = time.time() - t0
+        rtf = total_time / total_audio if total_audio > 0 else float("inf")
+        print(f"[TTS] Done: {chunk_idx} chunks, {total_audio:.2f}s audio, {total_time:.2f}s wall, RTF={rtf:.2f}")
 
     return StreamingResponse(generate(), media_type="audio/wav")
 
