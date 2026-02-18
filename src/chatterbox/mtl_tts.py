@@ -370,15 +370,17 @@ class ChatterboxMultilingualTTS:
             speech_tokens=initial_speech_tokens,
         )
 
-        # Setup model if not compiled
-        if not self.t3.compiled:
-            from .models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
-            from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
+        # Setup model backend, and reset alignment analyzer state per request
+        from .models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
+        from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
 
+        text_tokens_slice = (len_cond, len_cond + text_tokens.size(-1))
+
+        if not self.t3.compiled:
             alignment_stream_analyzer = AlignmentStreamAnalyzer(
                 self.t3.tfmr,
                 None,
-                text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+                text_tokens_slice=text_tokens_slice,
                 alignment_layer_idx=9,
                 eos_idx=self.t3.hp.stop_speech_token,
             )
@@ -391,6 +393,19 @@ class ChatterboxMultilingualTTS:
             )
             self.t3.patched_model = patched_model
             self.t3.compiled = True
+        else:
+            # Reset analyzer state for new request (text length may differ)
+            asa = self.t3.patched_model.alignment_stream_analyzer
+            i, j = text_tokens_slice
+            asa.text_tokens_slice = text_tokens_slice
+            asa.alignment = torch.zeros(0, j - i)
+            asa.curr_frame_pos = 0
+            asa.text_position = 0
+            asa.started = False
+            asa.started_at = None
+            asa.complete = False
+            asa.completed_at = None
+            asa.last_aligned_attn = None
 
         device = embeds.device
 
